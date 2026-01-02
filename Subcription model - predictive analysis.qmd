@@ -1,0 +1,1283 @@
+---
+title: "Subscription Performance Analysis and Churn Prediction of Ted and Poppy"
+author: "Group 11 :Dimple Meganathan (dim833) Fitrianur Meilin Yusuf (fyus697) /n Minyu Zhao(mzha906)/n Raghuraman Balasubramanian (rbal116)"
+format: pdf
+geometry:
+      - top=10mm
+      - left=18mm
+      - right=18mm
+      - bottom=12mm
+papersize: a4
+fontsize: 11pt    
+editor: visual
+---
+
+## *PURPOSE*
+
+This Quarto document performs an end-to-end analysis of subscription data with two goals:
+
+1\. Describe customer behavior and revenue patterns
+
+2\. Build and evaluate predictive models for customer churn
+
+## *The workflow follows a standard applied data science structure:*
+
+\- Data inspection and cleaning
+
+\- Feature preparation
+
+\- Model training
+
+\- Model evaluation and interpretation
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+#Loading Necessary Packages
+
+packages_needed <-  c( 
+  "GGally",
+  "e1071",
+  "pROC",
+  "randomForest",
+  'tidymodels',
+  "car", # For VIF calculation
+  "themis", #recipe steps for unbalanced data
+  "kknn", #k nearest neighbour
+  "rpart",  #decision trees
+  "rpart.plot", #plotting decision trees
+  "baguette", 
+  "ranger", #random forests
+  "xgboost", #xgboost
+  "lightgbm", "bonsai" #lightgbm
+  , "parallel", "future" # use multiple cores
+)
+packages_to_install <- packages_needed[!packages_needed %in%
+                                         installed.packages()]
+
+sapply(packages_to_install, install.packages,
+       dependencies=TRUE, repos="https://cloud.r-project.org")
+
+sapply(packages_needed, require, character=TRUE)
+
+library(tidyverse)
+library(tidymodels)
+library(workflows)
+library(car)
+library(reshape2)
+
+library(themis)       # For SMOTE, Oversampling, Undersampling
+library(kknn)         # KNN Classification
+library(ranger)       # Random Forest
+library(xgboost)      # XGBoost
+library(lightgbm)     # LightGBM
+library(future)       # Parallel processing
+```
+
+# Data Preparation
+
+```{r}
+#| label: read_data
+#| message: false
+#| echo: false
+#| results: hide
+
+# Load data
+
+#Put the Setwd to the path of the file in your system
+data <- read.csv("tedpoppydata_final.csv")
+```
+
+## **Data Validation**
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+# This block performs data validation such as duplicate and Null value check
+
+# Check if all user IDs are unique - To check the uniqueness of the dataset
+all_unique <-  n_distinct(data$user_ID) == nrow(data)
+
+# Check for missing values in the dataset
+missing_values <- colSums(is.na(data))
+
+# Convert to a data frame for better visualization
+missing_df <- data.frame(Variable = names(missing_values), Missing_Count = missing_values)
+```
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+#Create a replica of the new dataset so that orignial is not affected
+newdata<-data
+```
+
+## Data transformation
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+# Categorize age
+newdata <- newdata %>%
+  mutate(Age_Category = case_when(
+    age >= 17 & age <= 24 ~ "Gen Z (Digital Natives) till 24 ",
+    age >= 25 & age <= 40 ~ "Millennials (Career Growth) 25 - 40 ",
+    age >= 41 & age <= 56 ~ "Gen X (Family-Oriented) 41 - 56",
+    age >= 57 & age <= 100 ~ "Baby Boomers & Older (Traditional Shoppers) 57 -100",
+    TRUE ~ "Unknown"
+  ))
+
+# Identify columns with TRUE/FALSE values, excluding 'retained_binary'
+bool_cols <- names(newdata)[sapply(newdata, function(x) all(x %in% c(TRUE, FALSE))) & names(newdata) != "retained_binary"]
+
+# Create new variables with hot encoding encoding while keeping the original columns unchanged
+for (col in bool_cols) {
+  new_col_name <- paste0(col, "_binary")  # Create a new column name
+  newdata[[new_col_name]] <- ifelse(newdata[[col]] == TRUE, 1, 0)
+}
+
+
+# Modify 'support_ticket' into a Boolean field (0/1)
+newdata <- newdata %>%
+  mutate(support_ticket_binary = ifelse(support_ticket == "NotLast6Months", 0, 1))
+
+# combine support_ticket_binary and support_ticket_binary using Logical OR operation and store in a new variable
+newdata <- newdata %>%
+  mutate(payment_or_support_issue = ifelse(subscription_payment_problem_last6Months_binary == 1 | support_ticket_binary == 1, 1, 0))
+
+# Convert 'avg_purchase_value' to numeric by removing the dollar symbol
+newdata <- newdata %>%
+  mutate(avg_purchase_numeric = as.numeric(gsub("\\$", "", avg_purchase_value)))
+
+
+# Extract numeric values from 'days_since_last_web_purchase'
+newdata <- newdata %>%
+  mutate(days_since_last_web_purchase_numeric = as.numeric(gsub(" days", "", days_since_last_web_purchase)))
+
+# Create a new variable 'total_visits' by adding 'app_visits' and 'website_visits'
+newdata <- newdata %>%
+  mutate(total_visits = app_visits + website_visits)
+
+
+#mutate the com-post
+newdata <- newdata %>%
+  mutate(community_engagement = community_posts_made + community_topics_made)
+
+# Categorize avg_purchase_numeric
+newdata <- newdata %>%
+  mutate(avg_purchase_category = case_when(
+    avg_purchase_numeric <= 11.40 ~ "Low Spender",
+    avg_purchase_numeric > 11.40 & avg_purchase_numeric <= 26.80 ~ "Moderate Spender",
+    avg_purchase_numeric > 26.80 & avg_purchase_numeric <= 41.30 ~ "High Spender",
+    avg_purchase_numeric > 41.30 ~ "Very High Spender",
+    TRUE ~ "Unknown"
+  ))
+
+
+#Create a variable churned binary by inverting the retained binary
+newdata <- newdata %>%
+  mutate(churned_binary = ifelse(retained_binary == 0, 1, 0))
+
+# Categories the statisfied survey into 3 categories
+newdata <- newdata %>%
+  mutate(satisfaction_category = case_when(
+    satisfaction_survey %in% c("1", "2", "3") ~ "Not Satisfied",
+    satisfaction_survey %in% c("4", "5") ~ "Satisfied",
+    satisfaction_survey == "NoResponse" ~ "NoResponse",
+    TRUE ~ NA_character_
+  ))
+
+# Exclude duplicate coloumns
+excluded_cols <- c("avg_purchase_value", "days_since_last_web_purchase","user_ID","opened_last_email","discounted_rate","subscription_payment_problem_last6Months")
+
+newdata <- newdata %>%
+  select(-all_of(excluded_cols)) 
+```
+
+# Exploratory Data Analysis
+
+Getting the summary statistics
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+# Identify numeric and integer variables, excluding boolean (0/1)
+numeric_vars <- newdata %>%
+  select(where(is.numeric)) %>%
+  select(-where(~ all(. %in% c(0,1))))
+
+# Exploratory analyis
+summary_stats<-summary(numeric_vars)
+varaince_num<-var(numeric_vars)
+
+# Disable scientific notation
+options(scipen = 999)
+# Identify numeric and integer variables, excluding boolean (0/1)
+numeric_vars <- newdata %>%
+  select(where(is.numeric)) %>%
+  select(-where(~ all(. %in% c(0,1))))  # Remove binary variables
+
+# Compute Variance and Standard Deviation
+new_summary_stats  <- numeric_vars %>%
+  summarise(across(everything(), list(
+    Min = ~ min(., na.rm = TRUE),
+    Q1 = ~ quantile(., 0.25, na.rm = TRUE),
+    Mean = ~ mean(., na.rm = TRUE),
+    Median = ~ median(., na.rm = TRUE),
+    Q3 = ~ quantile(., 0.75, na.rm = TRUE),
+    Max = ~ max(., na.rm = TRUE),
+    Variance = ~ var(., na.rm = TRUE),
+    Std_Dev = ~ sd(., na.rm = TRUE)
+  )))
+
+# Transpose using base R `t()`
+new_summary_stats_transposed <- as.data.frame(t(new_summary_stats))
+
+# Fix the column names issue
+colnames(new_summary_stats_transposed) <- c("Value")  # Since transposition creates a single-column structure
+
+# Extract and format row names as a separate column
+new_summary_stats_transposed$Statistic <- rownames(new_summary_stats_transposed)  # Move row names into a column
+rownames(new_summary_stats_transposed) <- NULL  # Remove row names
+
+# Identify categorical and boolean variables
+categorical_vars <- newdata %>%
+  select(where(is.character), where(is.factor))
+
+# Compute count of each category for each categorical variable
+categorical_counts <- lapply(categorical_vars, table, useNA = "ifany")
+
+# Convert to a dataframe for better visualization
+categorical_counts_df <- bind_rows(lapply(names(categorical_counts),
+                                          function(col) {
+                                            tibble(Variable = col,
+                                                   Category = names(categorical_counts[[col]]),
+                                                   Count = as.numeric(categorical_counts[[col]]))
+                                          }))
+
+# Define the threshold for low satisfaction (adjust as needed)
+low_satisfaction_threshold <- 3  
+
+# Filter data for customers with low satisfaction and payment/support issues
+filtered_data <- newdata %>%
+  filter(satisfaction_survey < low_satisfaction_threshold & payment_or_support_issue == 1)
+
+# Count the number of churned and non-churned customers within the filtered data
+churn_summary <- filtered_data %>%
+  group_by(churned_binary) %>%
+  summarise(count = n())
+
+# Group by country code and churn status, then count occurrences
+churn_count_by_country_paymentissue <- newdata %>%
+  filter(subscription_payment_problem_last6Months_binary == 1) %>%
+  group_by(country_code, churned_binary) %>%
+  summarise(count = n(), .groups = "drop")
+
+# Group by country code and churn status, then count occurrences
+churn_count_by_country_supportTickets<- newdata %>%
+  filter(support_ticket_binary == 1) %>%
+  group_by(country_code, churned_binary) %>%
+  summarise(count = n(), .groups = "drop")
+
+# Count the number of customers based on discount and churn status
+discount_churn_count <- newdata %>%
+  group_by(discounted_rate_binary, churned_binary) %>%
+  summarise(count = n(), .groups = "drop")
+
+# Count the number of customers based on support ticket and payment issue status
+support_payment_count <- newdata %>%
+  group_by(support_ticket_binary, subscription_payment_problem_last6Months_binary) %>%
+  summarise(count = n(), .groups = "drop")
+
+# Count the number of customers based on support ticket, payment issue, and churn status
+support_payment_churn_count <- newdata %>%
+  group_by(support_ticket_binary, payment_or_support_issue, churned_binary) %>%
+  summarise(count = n(), .groups = "drop")
+
+# Count the number of customers based on support ticket, payment issue, and churn status
+satisfaction_payment_churn_count <- newdata %>%
+  group_by(satisfaction_survey, payment_or_support_issue, churned_binary) %>%
+  summarise(count = n(), .groups = "drop")
+
+# Count the number of customers based on support ticket, payment issue, and churn status
+satisfaction_support_payment_churn_count <- newdata %>%
+  group_by(satisfaction_survey,support_ticket_binary, payment_or_support_issue, churned_binary) %>%
+  summarise(count = n(), .groups = "drop")
+
+# Count the number of customers based on support ticket, payment issue, and churn status
+country_satisfaction_support_payment_churn_count <- newdata %>%
+  group_by(satisfaction_survey, country_code, support_ticket_binary, payment_or_support_issue, churned_binary) %>%
+  summarise(count = n(), .groups = "drop")
+
+# Count the number of customers based on support ticket, payment issue, and churn status
+type_satisfaction_support_payment_churn_count <- newdata %>%
+  group_by(subscription, satisfaction_category, support_ticket_binary,subscription_payment_problem_last6Months_binary, churned_binary) %>%
+  summarise(count = n(), .groups = "drop")
+
+# Count the number of customers based on support ticket, payment issue, and churn status
+type_satisfaction_support_payment_churn_count <- newdata %>%
+  group_by(subscription, satisfaction_category, support_ticket_binary, subscription_payment_problem_last6Months_binary, churned_binary) %>%
+  summarise(count = n(), .groups = "drop")
+```
+
+## Bivariate analysis
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+# Check statistical significance with all the variables to churned binary
+
+# Identify categorical, boolean, and numeric variables
+categorical_vars <- newdata %>%
+   select(where(is.character), where(is.factor))
+
+boolean_vars <- newdata %>%
+  select(where(~ all(. %in% c(0,1)))) %>% 
+  select(-all_of("churned_binary")) 
+
+numeric_vars <- newdata %>%
+  select(where(is.numeric)) %>%
+  select(-all_of(c("churned_binary")))  # Remove target & ID
+
+# Initialize an empty list to store results
+significance_results <- list()
+
+# Chi-Square Test for Categorical Variables
+for (var in colnames(categorical_vars)) {
+   tbl <- table(newdata[[var]], newdata$churned_binary)  # Contingency table
+   test <- chisq.test(tbl)  # Chi-square test
+   p_value <- test$p.value}
+
+significance_results[[var]] <- tibble(
+     Variable = var,
+     Test = "Chi-Square",
+     P_Value = p_value,
+     Significant = ifelse(p_value < 0.05, "Yes", "No"))
+
+# Chi-Square Test for Boolean Variables
+for (var in colnames(boolean_vars)) {
+   tbl <- table(newdata[[var]], newdata$churned_binary)  # Contingency table
+   test <- chisq.test(tbl)  # Chi-square test
+   p_value <- test$p.value}
+
+significance_results[[var]] <- tibble(
+  Variable = var,
+  Test = "Chi-Square",
+  P_Value = p_value,
+  Significant = ifelse(p_value < 0.05, "Yes", "No"))
+
+significance_results[[var]] <- tibble(
+     Variable = var,
+     Test = "T-Test",
+     P_Value = p_value,
+     Significant = ifelse(p_value < 0.05, "Yes", "No"))
+
+# Combine results into a single dataframe
+significance_results_df <- bind_rows(significance_results)
+
+# View results
+View(significance_results_df)
+```
+
+## Correlation matrix
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+# Identify numeric columns
+numeric_cols <- names(newdata)[sapply(newdata, is.numeric)]
+
+# Compute correlation matrix
+correlation_matrix <- cor(newdata[, numeric_cols], use = "pairwise.complete.obs")
+
+# Print correlation matrix
+print(correlation_matrix)
+
+# Visualize correlation matrix as a heatmap
+# Convert correlation matrix to long format for ggplot
+cor_melted <- melt(correlation_matrix)
+
+# Plot heatmap with correlation values
+ggplot(data = cor_melted, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", value)), color = "black", size = 3) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(title = "Correlation Matrix Heatmap", fill = "Correlation")
+```
+
+# Pre-processing Data for Model
+
+## Variable selection
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+# Select Relevant Features
+selected_features <- c("Age_Category", "total_visits",
+                       "satisfaction_survey", "discounted_rate_binary",
+                       "payment_or_support_issue","country_code",
+                       "avg_purchase_category",
+                       "churned_binary")
+
+df <- newdata[selected_features]
+
+# Convert Categorical Variables to Factors
+df <- df %>%
+  mutate(across(where(is.character), as.factor)) %>%
+  mutate(churned_binary = factor(churned_binary, levels = c(0, 1), labels = c("retained","churned")))
+```
+
+## Slice a sample
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+# # Sample 50,000 Rows Before Modeling
+# set.seed(1234)
+# df1 <- df[sample(nrow(df), 50000), ]
+# summary(df)
+```
+
+## Data partition
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+# Initially train the data with the sample of 50k 
+
+# # Split Data into Training (75%) & Testing (25%)
+# set.seed(123)
+# df_split <- initial_split(df1, prop = 0.75,
+#                           strata = churned_binary)
+# df_train <- training(df_split)
+# df_test  <- testing(df_split)
+
+
+
+
+
+```
+
+Make sure the data nature to continuing in split data
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+# # Create folds
+# set.seed(987)
+# cv_folds <- vfold_cv(df_train,
+#                      v = 10,
+#                      strata = churned_binary)
+
+```
+
+## Re-sampling methods
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+#Creating different Sampling method
+
+# # Define Oversampling Recipe
+# df_recipe_oversample <- 
+#   recipe(churned_binary ~ ., data = df_train) %>%
+#   step_dummy(all_nominal_predictors()) %>%
+#   step_normalize(all_numeric_predictors()) %>%
+#   step_zv(all_predictors()) %>%
+#   step_upsample(churned_binary, over_ratio = 1)
+# 
+# # Bake the oversampling recipe
+# df_recipe_oversample |> 
+#   prep() |> 
+#   bake(df_train) 
+# 
+# # Define Undersampling Recipe
+# df_recipe_undersample <- 
+#   recipe(churned_binary ~ ., data = df_train) %>%
+#   step_dummy(all_nominal_predictors()) %>%
+#   step_normalize(all_numeric_predictors()) %>%
+#   step_zv(all_predictors()) %>%
+#   step_downsample(churned_binary)  # Undersampling
+# 
+# # Bake the undersampling recipe
+# df_recipe_undersample |> 
+#   prep() |> 
+#   bake(df_train) 
+# 
+# # Define SMOTE Recipe
+# df_recipe_smote <- 
+#   recipe(churned_binary ~ ., data = df_train) %>%
+#   step_dummy(all_nominal_predictors()) %>%
+#   step_normalize(all_numeric_predictors()) %>%
+#   step_zv(all_predictors()) %>%
+#   step_smote(churned_binary)  # SMOTE
+# 
+# # Bake the SMOTE recipe
+# df_recipe_smote |> 
+#   prep() |> 
+#   bake(df_train) 
+```
+
+# Run Models
+
+## Create model for each models
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+# #logistic regression model
+# lr_model <-
+#    logistic_reg() |>
+#    set_engine("glm")
+# 
+# #knn model
+# knn_model <-
+#   nearest_neighbor(neighbors = 4) |>
+#   set_engine('kknn') |>
+#   set_mode('classification')
+# 
+# #random forest model
+# rf_model <-
+#   rand_forest(trees = 1000) |>
+#   set_engine("ranger",importance = "impurity") |>
+#   set_mode("classification")
+# 
+# #xg boost model
+# xgb_model <-
+#    boost_tree() |>
+#    set_engine("xgboost" ) |>
+#    set_mode("classification")
+# 
+# #lgbm model
+# lgbm_model <-
+#   boost_tree() |>
+#   set_engine("lightgbm" ) |>
+#   set_mode("classification")
+```
+
+## Create workflow for each models
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+# # Workflow for logistic regression for oversampling
+# lr_wflow_over <- workflow() |>
+#   add_model(lr_model) |>
+#   add_recipe(df_recipe_oversample)
+# 
+# # Workflow for K-Nearest Neighbours for oversampling
+# knn_wflow_over <- workflow() |>
+# add_model(knn_model) |>
+# add_recipe(df_recipe_oversample)
+# 
+# # Workflow for random Forestss for oversampling
+# rf_wflow_over <-   workflow() |>
+# add_model(rf_model) |>
+# add_recipe(df_recipe_oversample)
+# 
+# # Workflow for XGBoost for oversampling 
+# xgb_wflow_over <-
+#   workflow() |>
+#   add_model(xgb_model) |>
+#   add_recipe(df_recipe_oversample)
+# 
+# # Workflow for LightGBM  for oversampling 
+# lgbm_wflow_over <- 
+#   workflow() |> 
+#   add_model(lgbm_model) |> 
+#   add_recipe(df_recipe_oversample)
+# 
+# # Workflow for Logistic Regression for SMOTE
+# lr_wflow_smote <- workflow() |>
+#   add_model(lr_model) |>
+#   add_recipe(df_recipe_smote)
+# 
+# # Workflow for k-Nearest Neighbours for SMOTE
+# knn_wflow_smote <- workflow() |>
+#   add_model(knn_model) |>
+#   add_recipe(df_recipe_smote)
+# 
+# # Workflow for Random Forest for SMOTE
+# rf_wflow_smote <- workflow() |>
+# add_model(rf_model) |>
+# add_recipe(df_recipe_smote)
+# 
+# # Workflow for XGBoost for SMOTE
+# xgb_wflow_smote <- workflow() |>
+#   add_model(xgb_model) |>
+#   add_recipe(df_recipe_smote)
+# 
+# # Workflow for LightGBM for SMOTE
+# lgbm_wflow_smote <- workflow() |> 
+#   add_model(lgbm_model) |> 
+#   add_recipe(df_recipe_smote)
+# 
+# # Workflow for Logistic Regression for Undersampling
+# lr_wflow_under <- workflow() |>
+#   add_model(lr_model) |>
+#   add_recipe(df_recipe_undersample)
+# 
+# # Workflow for k-Nearest Neighbours for Undersampling
+# knn_wflow_under <- workflow() |>
+#   add_model(knn_model) |>
+#   add_recipe(df_recipe_undersample)
+# 
+# # Workflow for Random Forest for Undersampling
+# rf_wflow_under <- workflow() |>
+#   add_model(rf_model) |>
+#   add_recipe(df_recipe_undersample)
+# 
+# # Workflow for XGBoost for Undersampling
+# xgb_wflow_under <- workflow() |>
+#   add_model(xgb_model) |>
+#   add_recipe(df_recipe_undersample)
+# 
+# # LightGBM for Undersampling
+# lgbm_wflow_under <- workflow() |> 
+#   add_model(lgbm_model) |> 
+#   add_recipe(df_recipe_undersample)
+```
+
+## Model performance metrics
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+# # Select the metrics for getting the best model
+# data_metrics <- metric_set(accuracy, roc_auc, sensitivity, specificity, bal_accuracy,
+#                            ppv, npv, f_meas, kap, recall, precision)
+```
+
+## Run each models on each sampling methods
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+# 
+# Sys.time()
+# 
+# lr_res_over <- lr_wflow_over |>
+#   fit_resamples(
+#     resamples = cv_folds,
+#     metrics = data_metrics,
+#     control = control_grid(save_pred = TRUE,
+#                          parallel_over = "everything"))
+# 
+# Sys.time()
+# 
+# knn_res_over <- knn_wflow_over |>
+#   fit_resamples(
+#     resamples = cv_folds,
+#     metrics = data_metrics,
+#     control = control_grid(save_pred = TRUE,
+#                            parallel_over = "everything"))
+# 
+# Sys.time()
+# 
+# rf_res_over <- rf_wflow_over |>
+#   fit_resamples(
+#     resamples = cv_folds,
+#     metrics = data_metrics,
+#     control = control_grid(save_pred = TRUE,
+#                      parallel_over = "everything"))
+# 
+# Sys.time()
+# 
+# xgb_res_over <- xgb_wflow_over |>
+#   fit_resamples(
+#     resamples = cv_folds,
+#     metrics = data_metrics,
+#     control = control_grid(save_pred = TRUE,
+#                            parallel_over = "everything"))
+# 
+# Sys.time()
+# 
+# lgbm_res_over <- lgbm_wflow_over |>
+#   fit_resamples(
+#     resamples = cv_folds,
+#     metrics = data_metrics,
+#     control = control_grid(save_pred = TRUE,
+#                            parallel_over = "everything"))
+# 
+# Sys.time()
+# 
+# lr_res_smote <- lr_wflow_smote |>
+#   fit_resamples(
+#     resamples = cv_folds,
+#     metrics = data_metrics,
+#     control = control_grid(save_pred = TRUE,
+#                          parallel_over = "everything"))
+# 
+# Sys.time()
+# 
+# knn_res_smote <- knn_wflow_smote |>
+#   fit_resamples(
+#     resamples = cv_folds,
+#     metrics = data_metrics,
+#     control = control_grid(save_pred = TRUE,
+#                            parallel_over = "everything"))
+# 
+# Sys.time()
+# 
+# rf_res_smote <- rf_wflow_smote |>
+#   fit_resamples(
+#     resamples = cv_folds,
+#     metrics = data_metrics,
+#     control = control_grid(save_pred = TRUE,
+#                            parallel_over = "everything"))
+# 
+# Sys.time()
+# 
+# xgb_res_smote <- xgb_wflow_smote |>
+#   fit_resamples(
+#     resamples = cv_folds,
+#     metrics = data_metrics,
+#     control = control_grid(save_pred = TRUE,
+#                            parallel_over = "everything"))
+# 
+# Sys.time()
+# 
+# lgbm_res_smote <- lgbm_wflow_smote |>
+#   fit_resamples(
+#     resamples = cv_folds, 
+#     metrics = data_metrics,
+#     control = control_grid(save_pred = TRUE,
+#                          parallel_over = "everything")) 
+# 
+# Sys.time()
+# 
+# lr_res_under <- lr_wflow_under |>
+#   fit_resamples(
+#     resamples = cv_folds,
+#     metrics = data_metrics,
+#     control = control_grid(save_pred = TRUE,
+#                          parallel_over = "everything"))
+# 
+# Sys.time()
+# 
+# knn_res_under <- knn_wflow_under |>
+#   fit_resamples(
+#     resamples = cv_folds,
+#     metrics = data_metrics,
+#     control = control_grid(save_pred = TRUE,
+#                         parallel_over = "everything"))
+# 
+# Sys.time()
+# 
+# rf_res_under <- rf_wflow_under |>
+#   fit_resamples(
+#     resamples = cv_folds,
+#     metrics = data_metrics,
+#     control = control_grid(save_pred = TRUE,
+#                            parallel_over = "everything"))
+# 
+# Sys.time()
+# 
+# xgb_res_under <- xgb_wflow_under |>
+#   fit_resamples(
+#     resamples = cv_folds,
+#     metrics = data_metrics,
+#     control = control_grid(save_pred = TRUE,
+#                            parallel_over = "everything"))
+# 
+# Sys.time()
+# 
+# lgbm_res_under <- lgbm_wflow_under |>
+#   fit_resamples(
+#     resamples = cv_folds, 
+#     metrics = data_metrics,
+#     control = control_grid(save_pred = TRUE, parallel_over = "everything"))
+# 
+# Sys.time()
+```
+
+## Collect performance metrics of each models
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+# # Based on oversampling method
+# lr_res_over   |> collect_metrics(summarize = TRUE)
+# knn_res_over  |> collect_metrics(summarize = TRUE)
+# rf_res_over   |> collect_metrics(summarize = TRUE)
+# xgb_res_over  |> collect_metrics(summarize = TRUE)
+# lgbm_res_over |> collect_metrics(summarize = TRUE)
+# 
+# # Based on smote sampling method
+# lr_res_smote  |> collect_metrics(summarize = TRUE)
+# knn_res_smote  |> collect_metrics(summarize = TRUE)
+# rf_res_smote   |> collect_metrics(summarize = TRUE)
+# xgb_res_smote  |> collect_metrics(summarize = TRUE)
+# lgbm_res_smote |> collect_metrics(summarize = TRUE)
+# 
+# # Based on undersampling method
+# lr_res_under  |> collect_metrics(summarize = TRUE)
+# knn_res_under  |> collect_metrics(summarize = TRUE)
+# rf_res_under   |> collect_metrics(summarize = TRUE)
+# xgb_res_under  |> collect_metrics(summarize = TRUE)
+# lgbm_res_under |> collect_metrics(summarize = TRUE)
+```
+
+```{r}
+
+#| results: hide
+#| message: false
+#| echo: false
+
+# # Combine results for all models and sampling techniques
+# 
+# # Oversampling
+# all_res <- 
+#   bind_rows(lr_res_over   |> collect_metrics(summarize = TRUE) |> mutate(model = "Logistic Regression",
+#                                                                  sampling = "Oversampling"),
+#     knn_res_over  |> collect_metrics(summarize = TRUE) |> mutate(model = "KNN",
+#                                                                  sampling = "Oversampling"),
+#     rf_res_over   |> collect_metrics(summarize = TRUE) |> mutate(model = "Random Forest",
+#                                                                  sampling = "Oversampling"),
+#     xgb_res_over  |> collect_metrics(summarize = TRUE) |> mutate(model = "XGBoost",
+#                                                                  sampling = "Oversampling"),
+#     lgbm_res_over |> collect_metrics(summarize = TRUE) |> mutate(model = "LightGBM",
+#                                                                  sampling = "Oversampling"),
+#     
+# # SMOTE
+#     lr_res_over    |> collect_metrics(summarize = TRUE) |> mutate(model = "Logistic Regression",
+#                                                                   sampling = "SMOTE"),
+#     knn_res_smote  |> collect_metrics(summarize = TRUE) |> mutate(model = "KNN",
+#                                                                   sampling = "SMOTE"),
+#     rf_res_smote   |> collect_metrics(summarize = TRUE) |> mutate(model = "Random Forest",
+#                                                                   sampling = "SMOTE"),
+#     xgb_res_smote  |> collect_metrics(summarize = TRUE) |> mutate(model = "XGBoost",
+#                                                                   sampling = "SMOTE"),
+#     lgbm_res_smote |> collect_metrics(summarize = TRUE) |> mutate(model = "LightGBM",
+#                                                                   sampling = "SMOTE"),
+# # Undersampling
+#   r_res_over    |> collect_metrics(summarize = TRUE) |> mutate(model = "Logistic Regression",
+#                                                                sampling = "Undersampling"),
+#     knn_res_under  |> collect_metrics(summarize = TRUE) |> mutate(model = "KNN",
+#                                                                   sampling = "Undersampling"),
+#     rf_res_under   |> collect_metrics(summarize = TRUE) |> mutate(model = "Random Forest",
+#                                                                   sampling = "Undersampling"),
+#     xgb_res_under  |> collect_metrics(summarize = TRUE) |> mutate(model = "XGBoost",
+#                                                                   sampling = "Undersampling"),
+#     lgbm_res_under |> collect_metrics(summarize = TRUE) |> mutate(model = "LightGBM",
+#                                                                   sampling = "Undersampling"))
+# 
+# all_res |> arrange(sampling, model)
+# 
+# # Barplot for performance metrics
+# all_res |> 
+#   ggplot() + 
+#   geom_col(aes(y = reorder(interaction(model, sampling), desc(mean)), 
+#                x = mean, fill = sampling)) +
+#   facet_wrap(facets = vars(.metric), ncol = 3) +
+#   labs(y = "Model & Sampling", x = "Metric Value", fill = "Sampling") + 
+#   xlim(0, 1) +
+#   theme(panel.border = element_rect(colour = "black", fill = NA, linewidth = 1)) +
+#   theme(legend.position = "bottom")
+```
+
+## Collect prediction of each models
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+# # Combine predictions for all models and sampling techniques
+# # Oversampling
+# all_pred <- 
+#   bind_rows(
+#     lr_res_over   |> collect_predictions()  |> mutate(model = "Logistic Regression",
+#                                                       sampling = "Oversampling"),
+#     knn_res_over  |> collect_predictions()  |> mutate(model = "KNN",
+#                                                       sampling = "Oversampling"),
+#     rf_res_over   |> collect_predictions()  |> mutate(model = "Random Forest",
+#                                                       sampling = "Oversampling"),
+#     xgb_res_over  |> collect_predictions()  |> mutate(model = "XGBoost",
+#                                                       sampling = "Oversampling"),
+#     lgbm_res_over |> collect_predictions()  |> mutate(model = "LightGBM",
+#                                                       sampling = "Oversampling"),
+#     
+# # SMOTE
+#     lr_res_over   |> collect_predictions()  |> mutate(model = "Logistic Regression",
+#                                                       sampling = "SMOTE"),
+#     knn_res_smote  |> collect_predictions()  |> mutate(model = "KNN",
+#                                                        sampling = "SMOTE"),
+#     rf_res_smote   |> collect_predictions()  |> mutate(model = "Random Forest",
+#                                                        sampling = "SMOTE"),
+#     xgb_res_smote  |> collect_predictions()  |> mutate(model = "XGBoost",
+#                                                        sampling = "SMOTE"),
+#     lgbm_res_smote |> collect_predictions()  |> mutate(model = "LightGBM",
+#                                                        sampling = "SMOTE"),
+# # Undersampling
+#     lr_res_over    |> collect_predictions()  |> mutate(model = "Logistic Regression",
+#                                                        sampling = "Undersampling"),
+#     knn_res_under  |> collect_predictions()  |> mutate(model = "KNN",
+#                                                        sampling = "Undersampling"),
+#     rf_res_under   |> collect_predictions()  |> mutate(model = "Random Forest",
+#                                                        sampling = "Undersampling"),
+#     xgb_res_under  |> collect_predictions()  |> mutate(model = "XGBoost",
+#                                                        sampling = "Undersampling"),
+#     lgbm_res_under |> collect_predictions()  |> mutate(model = "LightGBM",
+#                                                        sampling = "Undersampling"))
+# 
+# # ROC Curve
+# all_pred |> 
+#   group_by(model, sampling) |>
+#   roc_curve(churned_binary, .pred_churned, event_level = "second" ) |>
+#   autoplot(aes(color = sampling, linetype = model)) + 
+#   facet_wrap(facets = vars(sampling), ncol = 3) + 
+#   theme(legend.position = "bottom") + 
+#   labs(title = "ROC Curves by Sampling Technique and Model", 
+#        x = "False Positive Rate", 
+#        y = "True Positive Rate",
+#        color = "Sampling Method", 
+#        linetype = "Model")
+```
+
+Show best metrics
+
+```{r}
+# #| results: hide
+# #| message: false
+# #| echo: false
+# 
+# best_by_metric<-all_res |> 
+#   group_by(.metric) |> 
+#   slice_max(mean) |>  
+#   select(.metric, mean, model,sampling)
+# 
+# # LightGBM performed well overall
+```
+
+# Finalize the model (LightGBM)
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+# Split Data into Training (75%) & Testing (25%)
+set.seed(123)
+df_split <- initial_split(df, prop = 0.75, strata = churned_binary)
+df_train <- training(df_split)
+df_test  <- testing(df_split)
+
+# # Create folds
+set.seed(987)
+cv_folds <- vfold_cv(df_train, 
+                     v = 10, 
+                     strata = churned_binary) 
+```
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+# Define Oversampling Recipe
+df_recipe_oversample <- 
+  recipe(churned_binary ~ ., data = df_train) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_upsample(churned_binary, over_ratio = 1)  # Oversampling
+
+
+glimpse(df_train)
+df_recipe_oversample |> 
+  prep() |> 
+  bake(df_train) 
+## |>  glimpse()
+
+# Define Undersampling Recipe
+df_recipe_undersample <- 
+  recipe(churned_binary ~ ., data = df_train) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_downsample(churned_binary)  # Undersampling
+
+glimpse(df_train)
+df_recipe_undersample |> 
+  prep() |> 
+  bake(df_train) 
+
+# Define SMOTE Recipe
+df_recipe_smote <- 
+  recipe(churned_binary ~ ., data = df_train) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_smote(churned_binary)  # SMOTE
+
+glimpse(df_train)
+df_recipe_smote |> 
+  prep() |> 
+  bake(df_train) 
+```
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+#create lgbm model
+lgbm_model <- 
+  boost_tree() |>
+  set_engine("lightgbm" ) |>
+  set_mode("classification")
+
+#create workflow for lgbm
+lgbm_wflow_over <- 
+  workflow() |> 
+  add_model(lgbm_model) |> 
+  add_recipe(df_recipe_oversample)
+
+lgbm_wflow_smote <- workflow() |> 
+  add_model(lgbm_model) |> 
+  add_recipe(df_recipe_smote)
+
+lgbm_wflow_under <- workflow() |> 
+  add_model(lgbm_model) |> 
+  add_recipe(df_recipe_undersample)
+
+#choose the metrics
+data_metrics <- metric_set(accuracy, roc_auc, sensitivity, specificity, bal_accuracy,
+                           ppv, npv, f_meas, kap, recall, precision)
+```
+
+## Run finalized model (LightGBM)
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+Sys.time()
+
+lgbm_res_over <- lgbm_wflow_over |>
+  fit_resamples(
+    resamples = cv_folds, 
+    metrics = data_metrics,
+    control = control_grid(save_pred = TRUE,
+                           parallel_over = "everything")
+  ) 
+
+Sys.time()
+
+lgbm_res_smote <- lgbm_wflow_smote |> fit_resamples(
+  resamples = cv_folds, 
+  metrics = data_metrics,
+  control = control_grid(save_pred = TRUE, parallel_over = "everything")
+) 
+
+Sys.time()
+
+lgbm_res_under <- lgbm_wflow_under |> fit_resamples(
+  resamples = cv_folds, 
+  metrics = data_metrics,
+  control = control_grid(save_pred = TRUE, parallel_over = "everything")
+) 
+Sys.time()
+```
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+#collect individudal results
+lgbm_res_over |> collect_metrics(summarize = TRUE)
+
+lgbm_res_smote |> collect_metrics(summarize = TRUE)
+
+lgbm_res_under |> collect_metrics(summarize = TRUE)
+
+
+# Combine results for all models and sampling techniques
+all_res <- 
+  bind_rows(
+    # Oversampling
+    lgbm_res_over |> collect_metrics(summarize = TRUE) |> mutate(model = "LightGBM", sampling = "Oversampling"),
+    
+    # SMOTE
+    lgbm_res_smote |> collect_metrics(summarize = TRUE) |> mutate(model = "LightGBM", sampling = "SMOTE"),
+    
+    # Undersampling
+    lgbm_res_under |> collect_metrics(summarize = TRUE) |> mutate(model = "LightGBM", sampling = "Undersampling")
+  )
+
+# View combined results
+all_res |> arrange(sampling, model)
+all_res
+
+
+# Combine predictions for all models and sampling techniques
+all_pred <- 
+  bind_rows(
+    # Oversampling
+    lgbm_res_over |> collect_predictions()  |> mutate(model = "LightGBM", sampling = "Oversampling"),
+    
+    # SMOTE
+    lgbm_res_smote |> collect_predictions()  |> mutate(model = "LightGBM", sampling = "SMOTE"),
+    
+    # Undersampling
+    lgbm_res_under |> collect_predictions()  |> mutate(model = "LightGBM", sampling = "Undersampling")
+  )
+
+# View combined predictions (ROC Curve)
+all_pred |> 
+  group_by(model, sampling) |> 
+  roc_curve(churned_binary, .pred_churned, event_level = "second" ) |>
+  autoplot(aes(color = sampling, linetype = model)) + 
+  facet_wrap(facets = vars(sampling), ncol = 3) +
+  theme(legend.position = "bottom") + 
+  labs(title = "ROC Curves by Sampling Technique and Model", 
+       x = "False Positive Rate", 
+       y = "True Positive Rate",
+       color = "Sampling Method", 
+       linetype = "Model")
+
+# create barplot to show performance metrics
+all_res |> 
+  ggplot() + 
+  geom_col(aes(y = reorder(interaction(model, sampling), desc(mean)), 
+               x = mean, fill = sampling)) +
+  facet_wrap(facets = vars(.metric), ncol = 3) +
+  labs(y = "Model & Sampling", x = "Metric Value", fill = "Sampling") + 
+  xlim(0, 1) +
+  theme(panel.border = element_rect(colour = "black", fill = NA, linewidth = 1)) +
+  theme(legend.position = "bottom")
+
+# show the best metrics
+best_by_metric<-all_res |> 
+  group_by(.metric) |> 
+  slice_max(mean) |>  
+  select(.metric, mean, model,sampling)
+```
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+#refer the workflow as the final one
+final_wflow_under1 <- lgbm_wflow_under
+final_wflow_smote1 <- lgbm_wflow_smote
+final_wflow_over1 <- lgbm_wflow_over
+```
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+#finalized model fit
+final_fit_under1 <- 
+  final_wflow_under1 |>
+  last_fit(df_split,
+           metrics = data_metrics)
+
+final_fit_smote1 <- 
+  final_wflow_smote1 |>
+  last_fit(df_split,
+           metrics = data_metrics)
+
+final_fit_over1 <- 
+  final_wflow_over1 |>
+  last_fit(df_split,
+           metrics = data_metrics)
+```
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+#collect finalized performance metrics
+final_res_under1 <- final_fit_under1 |>  collect_metrics()
+final_res_smote1 <- final_fit_smote1 |>  collect_metrics()
+final_res_over1 <- final_fit_over1 |>  collect_metrics()
+
+#collect finalized prediction
+final_pred_under1 <- final_fit_under1 |>
+  collect_predictions() 
+final_pred_smote1 <- final_fit_smote1 |>
+  collect_predictions() 
+final_pred_over1 <- final_fit_over1 |>
+  collect_predictions() 
+```
+
+## Confusion matrix run on test data
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+#finalized confusion matrix
+final_conf_under1 <- final_pred_under1 |>
+  conf_mat(truth = churned_binary, .pred_class) 
+final_conf_under1
+
+final_conf_smote1 <- final_pred_smote1 |>
+  conf_mat(truth = churned_binary, .pred_class) 
+final_conf_smote1
+
+final_conf_over1 <- final_pred_over1 |>
+  conf_mat(truth = churned_binary, .pred_class)
+final_conf_over1
+```
+
+## Importance score for each variables
+
+```{r}
+#| results: hide
+#| message: false
+#| echo: false
+
+lgbm_fit <- lgbm_model |>
+  fit(churned_binary ~ ., data = df)
+# Extract booster object
+lgbm_extracted <- extract_fit_engine(lgbm_fit)
+
+# Get feature importance
+importance_df <- lgb.importance(lgbm_extracted)
+
+# Print importance scores
+print(importance_df)
+```
