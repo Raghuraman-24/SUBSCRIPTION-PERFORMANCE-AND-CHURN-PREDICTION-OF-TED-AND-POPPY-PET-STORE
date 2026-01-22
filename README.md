@@ -74,7 +74,7 @@ Raw data → Cleaning & feature engineering → Model training → Evaluation �
 
 ### Dataset
 - **Location:**  
-  https://github.com/Raghuraman-24/SUBSCRIPTION-PERFORMANCE-AND-CHURN-PREDICTION-OF-TED-AND-POPPY-PET-STORE/blob/main/Dataset/tedpoppydata_final.csv
+  - https://github.com/Raghuraman-24/SUBSCRIPTION-PERFORMANCE-AND-CHURN-PREDICTION-OF-TED-AND-POPPY-PET-STORE/blob/main/Dataset/tedpoppydata_final.csv
 
 - **Description:**  
   Customer-level subscription data for a fictional pet food subscription service (Ted & Poppy Pet Store), representing Q4 2024 activity.
@@ -107,8 +107,8 @@ Raw data → Cleaning & feature engineering → Model training → Evaluation �
 
 ### Metadata - 
 - **Location:**  
-  Included within the same `Dataset/` directory
-  https://github.com/Raghuraman-24/SUBSCRIPTION-PERFORMANCE-AND-CHURN-PREDICTION-OF-TED-AND-POPPY-PET-STORE/blob/main/Dataset/ted%20and%20poppy%20metadata.csv
+  Included within the same `Dataset/` directory 
+  - https://github.com/Raghuraman-24/SUBSCRIPTION-PERFORMANCE-AND-CHURN-PREDICTION-OF-TED-AND-POPPY-PET-STORE/blob/main/Dataset/ted%20and%20poppy%20metadata.csv
 
 - **Purpose:**  
   Documents variable definitions, assumptions, and feature categorization to improve transparency, auditability, and interpretability.
