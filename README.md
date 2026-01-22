@@ -187,8 +187,5 @@ This project emphasizes analytical validation over application-level testing.
 - **Libraries:** tidyverse, caret, lightgbm, xgboost, randomForest, class, ggplot2
 - **Format:** Quarto (`.qmd`)
 
-### Local Setup
-```bash
-git clone https://github.com/Raghuraman-24/SUBSCRIPTION-PERFORMANCE-AND-CHURN-PREDICTION-OF-TED-AND-POPPY-PET-STORE.git
-cd SUBSCRIPTION-PERFORMANCE-AND-CHURN-PREDICTION-OF-TED-AND-POPPY-PET-STORE
+
 
